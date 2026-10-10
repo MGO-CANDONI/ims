@@ -346,6 +346,55 @@ function unitCostBalance(item) {
   const { qty, cost } = itemRunningTotals(item);
   return qty > 0 ? cost / qty : Number(item.unit_cost) || 0;
 }
+
+/** Every receipt of this item as a LOT, with how much of it is still on the shelf.
+ *
+ *  A lot is one receipt: an AIR posted to the registry, or an opening balance. Since Oct 2026 an
+ *  issuance names the lot it came out of (source_entry_id), so a lot's remaining quantity is its
+ *  own quantity less the issuances charged against it.
+ *
+ *  Issuances made BEFORE that change carry no source. They still have to come out of somewhere, or
+ *  the lots would add up to more stock than the item actually has - so they are charged against the
+ *  oldest lots first. The guarantee worth keeping in mind: the lots' remaining quantities always
+ *  sum to qtyBalance(item), whatever mix of old and new issuances the item carries.
+ */
+function itemLots(item) {
+  const sorted = itemLedgerSorted(item);
+  const lots = sorted.filter((e) => e.type === "receipt").map((e) => ({
+    entry_id: e.id,
+    date: e.date || "",
+    ref: e.ref || "",                     // AIR No., or "Opening balance"
+    air_id: e.air_id || null,
+    unit_cost: Number(e.unit_cost) || 0,
+    batch_no: e.batch_no || "",
+    expiry_date: e.expiry_date || "",
+    qty: Number(e.qty) || 0,
+    remaining: Number(e.qty) || 0,
+  }));
+  const byId = new Map(lots.map((l) => [l.entry_id, l]));
+  let untagged = 0;
+  for (const e of sorted) {
+    if (e.type === "receipt") continue;
+    const qty = Number(e.qty) || 0;
+    const lot = e.source_entry_id ? byId.get(e.source_entry_id) : null;
+    if (lot) lot.remaining -= qty;
+    else untagged += qty;                 // legacy issuance, or a lot that has since been removed
+  }
+  for (const lot of lots) {
+    if (untagged <= 0) break;
+    const take = Math.min(lot.remaining, untagged);
+    if (take > 0) { lot.remaining -= take; untagged -= take; }
+  }
+  return lots;
+}
+
+/** How a lot reads on screen and on the printed RIS. */
+function lotLabel(lot) {
+  const bits = [lot.ref || "(no reference)"];
+  if (lot.batch_no) bits.push("Batch " + lot.batch_no);
+  if (lot.expiry_date) bits.push("exp. " + fmtDate(lot.expiry_date));
+  return bits.join(" · ");
+}
 function isLowStock(item) {
   const rp = Number(item.reorder_point) || 0;
   if (rp <= 0) return false;
@@ -514,13 +563,22 @@ function scHtml(item) {
 
 function risHtml(r) {
   const lines = r.lines || [];
-  const rows = lines.map((l) => `
+  // Appendix 48 is a prescribed form, so the source AIR goes INSIDE the Remarks column rather than
+  // as an extra column - the printout stays the official layout while still showing, per line,
+  // which delivery the stock was drawn from.
+  const rows = lines.map((l) => {
+    const src = l.source_ref
+      ? [l.source_ref, l.source_batch_no ? "Batch " + l.source_batch_no : "", l.source_expiry_date ? "exp. " + fmtDate(l.source_expiry_date) : ""].filter(Boolean).join(" ")
+      : "";
+    const remarks = [l.remarks || "", src ? `[${src}]` : ""].filter(Boolean).join(" ");
+    return `
     <tr>
       <td>${esc(l.stock_no)}</td><td>${esc(l.unit)}</td><td>${esc(l.description)}</td>
       <td class="right">${fmtNum(l.qty_requested)}</td>
       <td class="right">${fmtNum(l.qty_issued)}</td>
-      <td>${esc(l.remarks || "")}</td>
-    </tr>`).join("");
+      <td>${esc(remarks)}</td>
+    </tr>`;
+  }).join("");
   const pad = Math.max(0, 12 - lines.length);
   const blanks = Array.from({ length: pad }).map(() => `<tr><td>&nbsp;</td><td></td><td></td><td></td><td></td><td></td></tr>`).join("");
   return `
@@ -1554,6 +1612,7 @@ function openRisDetail(id) {
       <td>${esc(l.stock_no)}</td><td>${esc(l.description)}</td>
       <td class="num">${fmtNum(l.qty_requested)}</td>
       <td class="num">${l.qty_issued != null ? fmtNum(l.qty_issued) : "—"}</td>
+      <td>${l.source_ref ? `${esc(l.source_ref)}${l.source_batch_no ? `<div class="small">Batch ${esc(l.source_batch_no)}${l.source_expiry_date ? " &middot; exp. " + fmtDate(l.source_expiry_date) : ""}</div>` : ""}${l.unit_cost != null ? `<div class="small">@ ${fmtMoney(l.unit_cost)}</div>` : ""}` : `<span class="small">—</span>`}</td>
       <td>${esc(l.remarks || "")}</td>
     </tr>`).join("");
   openModal(`
@@ -1569,7 +1628,7 @@ function openRisDetail(id) {
         <div><b>${r.issue_type === "distribution" ? "Recipient" : "Issued to"}</b><br/>${esc(risIssuedTo(r))}</div>
       </div>
       <div class="hr"></div>
-      <div class="table-wrap"><table><thead><tr><th>Stock No.</th><th>Description</th><th class="num">Qty Req.</th><th class="num">Qty Issued</th><th>Remarks</th></tr></thead><tbody>${rows}</tbody></table></div>
+      <div class="table-wrap"><table><thead><tr><th>Stock No.</th><th>Description</th><th class="num">Qty Req.</th><th class="num">Qty Issued</th><th>Source AIR</th><th>Remarks</th></tr></thead><tbody>${rows}</tbody></table></div>
       <p class="small" style="margin-top:10px;"><b>Purpose:</b> ${esc(r.purpose || "")}</p>
     </div>
     <div class="modal-foot">
@@ -1593,17 +1652,23 @@ function openIssueRisModal(id) {
   openModal(`
     <div class="modal-head"><h3>Issue RIS ${esc(r.ris_no)}</h3><button class="btn ghost" onclick="closeModal()">✕</button></div>
     <div class="modal-body">
-      <p class="small">Confirm the quantity actually issued for each line. This deducts stock immediately and records it as
+      <p class="small">Confirm the quantity actually issued for each line, and <b>say which AIR the stock comes out of</b>. This deducts stock immediately and records it as
         <b>${esc(issueTypeLabel(r.issue_type))}</b> to <b>${esc(risIssuedTo(r))}</b> - it cannot be edited afterward (only reversed).</p>
-      <table class="line-table"><thead><tr><th>Item</th><th class="num">On hand</th><th class="num">Qty Req.</th><th>Qty Issued</th></tr></thead>
+      <p class="small">The issued cost is the <b>unit cost of the AIR you pick</b>, not an average, so the delivery a line is charged to is the delivery it is costed at. A line can only draw from one AIR; if the quantity needs stock from two deliveries, go back and make it two lines.</p>
+      <table class="line-table"><thead><tr><th>Item</th><th class="num">On hand</th><th class="num">Qty Req.</th><th>Qty Issued</th><th>Source AIR</th></tr></thead>
       <tbody>
         ${(r.lines || []).map((l, i) => {
           const item = S.items.get(l.item_id);
+          const lots = item ? itemLots(item).filter((lot) => lot.remaining > 1e-6) : [];
           return `<tr>
             <td>${esc(l.stock_no)} - ${esc(l.description)}</td>
             <td class="num">${item ? fmtNum(qtyBalance(item)) + " " + esc(item.unit) : "—"}</td>
             <td class="num">${fmtNum(l.qty_requested)}</td>
             <td><input class="iss_qty" data-idx="${i}" type="number" step="0.01" value="${l.qty_issued != null ? l.qty_issued : l.qty_requested}"/></td>
+            <td>${lots.length ? `<select class="iss_src" data-idx="${i}" style="min-width:230px;">
+                <option value="">— choose AIR —</option>
+                ${lots.map((lot) => `<option value="${esc(lot.entry_id)}" ${l.source_entry_id === lot.entry_id ? "selected" : ""}>${esc(lotLabel(lot))} — ${fmtNum(lot.remaining)} left @ ${fmtMoney(lot.unit_cost)}</option>`).join("")}
+              </select>` : `<span class="small">no stock on hand</span>`}</td>
           </tr>`;
         }).join("")}
       </tbody></table>
@@ -1617,28 +1682,63 @@ function openIssueRisModal(id) {
 function confirmIssueRis(id) {
   if (blockIfViewOnly("ris")) return;
   const r = S.ris.get(id);
+  // Each line is charged to ONE lot - the AIR (or opening balance) the stock physically came from.
+  // The lot is resolved here, before anything is written, so a line that can't name its source
+  // stops the whole issuance rather than quietly falling back to an average cost.
+  const lots = new Map();
   const lines = (r.lines || []).map((l, i) => {
     const qtyEl = document.querySelector(`.iss_qty[data-idx="${i}"]`);
-    return { ...l, qty_issued: Number(qtyEl.value) || 0 };
+    const srcEl = document.querySelector(`.iss_src[data-idx="${i}"]`);
+    const qty_issued = Number(qtyEl.value) || 0;
+    const source_entry_id = srcEl ? srcEl.value : (l.source_entry_id || "");
+    const item = S.items.get(l.item_id);
+    const lot = item && source_entry_id
+      ? itemLots(item).find((x) => x.entry_id === source_entry_id)
+      : null;
+    if (lot) lots.set(i, lot);
+    return {
+      ...l, qty_issued, source_entry_id,
+      source_ref: lot ? lot.ref : "",
+      source_air_id: lot ? lot.air_id : null,
+      source_batch_no: lot ? lot.batch_no : "",
+      source_expiry_date: lot ? lot.expiry_date : "",
+      unit_cost: lot ? lot.unit_cost : null,
+    };
   });
-  for (const l of lines) {
+  for (let i = 0; i < lines.length; i++) {
+    const l = lines[i];
+    if (l.qty_issued <= 0) continue;          // a line issuing nothing needs no source
     const item = S.items.get(l.item_id);
     if (!item) continue;
+    const lot = lots.get(i);
+    if (!lot) { toast(`Choose the AIR that ${item.description} is issued from.`, true); return; }
+    if (l.qty_issued > lot.remaining + 1e-6) {
+      toast(`${lot.ref || "That AIR"} only has ${fmtNum(lot.remaining)} ${item.unit} of ${item.description} left. Reduce the quantity, or split this into a second line drawn from another AIR.`, true);
+      return;
+    }
     if (l.qty_issued > qtyBalance(item) + 1e-6) { toast(`Not enough stock for ${item.description} (balance ${fmtNum(qtyBalance(item))} ${item.unit}).`, true); return; }
   }
   const disposition = issueTypeInfo(r.issue_type).disposition;
   const office = r.office || r.department || "";
   const recipient = r.issue_type === "distribution" ? risIssuedTo(r) : "";
   const writes = [];
-  for (const l of lines) {
+  for (let i = 0; i < lines.length; i++) {
+    const l = lines[i];
     if (l.qty_issued <= 0) continue;
     const item = S.items.get(l.item_id);
     if (!item) continue;
-    const uc = unitCostBalance(item);
+    const lot = lots.get(i);
+    // Specific identification: the line is valued at the unit cost of the AIR it was drawn from.
+    const uc = lot ? lot.unit_cost : unitCostBalance(item);
     const entry = {
       id: uid(), type: "issue", date: r.date, ref: r.ris_no,
       qty: l.qty_issued, unit_cost: uc, total_cost: round2(l.qty_issued * uc),
       office, disposition, recipient, ris_id: r.id,
+      source_entry_id: l.source_entry_id || "",
+      source_ref: l.source_ref || "",
+      source_air_id: l.source_air_id || null,
+      batch_no: l.source_batch_no || "",
+      expiry_date: l.source_expiry_date || "",
       by: S.currentUser.email, at: Date.now(),
     };
     const ledger = (item.ledger || []).concat([entry]);
@@ -1680,12 +1780,15 @@ function printRis(id) { openPrintWindow(risHtml(S.ris.get(id)), "portrait"); }
 
 function exportRisCsv() {
   const rows = filterRisRows(S.risFilter);
-  const header = ["RIS No.", "Date", "Type", "Department", "Office", "Recipient", "Barangay", "Purpose", "Status", "Stock No.", "Description", "Qty Requested", "Qty Issued", "Remarks"];
+  const header = ["RIS No.", "Date", "Type", "Department", "Office", "Recipient", "Barangay", "Purpose", "Status", "Stock No.", "Description", "Qty Requested", "Qty Issued", "Source AIR", "Batch No.", "Expiry", "Unit Cost", "Amount", "Remarks"];
   const lines = [header.join(",")];
   for (const r of rows) {
     for (const l of r.lines || []) {
+      const amount = l.unit_cost != null && l.qty_issued != null ? round2(l.qty_issued * l.unit_cost) : "";
       lines.push([r.ris_no, r.date, issueTypeLabel(r.issue_type), r.department, r.office, r.recipient_name, r.recipient_barangay,
-        r.purpose, r.status, l.stock_no, l.description, l.qty_requested, l.qty_issued, l.remarks].map(csvField).join(","));
+        r.purpose, r.status, l.stock_no, l.description, l.qty_requested, l.qty_issued,
+        l.source_ref || "", l.source_batch_no || "", l.source_expiry_date || "", l.unit_cost != null ? l.unit_cost : "", amount,
+        l.remarks].map(csvField).join(","));
     }
   }
   browserDownload(`RIS_${S.currentFund}_${todayStr()}.csv`, lines.join("\n"), "text/csv");
