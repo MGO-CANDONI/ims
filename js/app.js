@@ -1451,13 +1451,68 @@ function renderRis() {
   restoreFocus(saved);
 }
 
+/** The stock still on hand, grouped by the document it arrived on (an AIR, or an opening balance).
+ *  This is what lets a RIS be started FROM an AIR instead of hunting item by item. */
+function stockSources(fund) {
+  const groups = new Map();
+  for (const item of activeItems(fund)) {
+    for (const lot of itemLots(item)) {
+      if (lot.remaining <= 1e-6) continue;
+      const key = lot.air_id || "ref:" + (lot.ref || "opening");
+      const g = groups.get(key) || { key, air_id: lot.air_id, ref: lot.ref || "Opening balance", date: lot.date || "", lots: [] };
+      if (!g.date || (lot.date && lot.date < g.date)) g.date = lot.date;
+      g.lots.push({ ...lot, item });
+      groups.set(key, g);
+    }
+  }
+  return [...groups.values()].sort((a, b) => (b.date || "").localeCompare(a.date || ""));
+}
+
+/** Fill the line table from one AIR: a line per item of that AIR still holding stock, each already
+ *  tied to the lot it came from, so the issuance is costed at that delivery's price. Lines already
+ *  on the draft are left alone - picking a second AIR adds to the RIS rather than replacing it. */
+function loadRisLinesFromAir() {
+  const sel = document.getElementById("ris_source_air");
+  if (!sel || !sel.value) { toast("Pick an AIR first.", true); return; }
+  const g = stockSources(S.currentFund).find((x) => x.key === sel.value);
+  if (!g) return;
+  _risDraftLines = _risDraftLines.filter((l) => l.item_id);
+  let added = 0;
+  for (const lot of g.lots) {
+    if (_risDraftLines.some((l) => l.source_entry_id === lot.entry_id)) continue;
+    _risDraftLines.push({
+      item_id: lot.item.id, stock_no: lot.item.stock_no, description: lot.item.description,
+      unit: lot.item.unit, qty_requested: lot.remaining, qty_issued: null, remarks: "",
+      source_entry_id: lot.entry_id, source_ref: lot.ref, source_air_id: lot.air_id,
+      source_batch_no: lot.batch_no, source_expiry_date: lot.expiry_date, unit_cost: lot.unit_cost,
+    });
+    added++;
+  }
+  if (!_risDraftLines.length) _risDraftLines.push({});
+  renderRisLinesTable();
+  toast(added ? `${added} item(s) loaded from ${g.ref}. Adjust the quantities to what is actually being issued.`
+              : `Every item from ${g.ref} is already on this RIS.`);
+}
+
+/** The lots of one item that a line may be drawn from - plus whatever the line already points at,
+ *  so an existing choice never vanishes from its own dropdown. */
+function lotsForLine(item, l) {
+  if (!item) return [];
+  return itemLots(item).filter((lot) => lot.remaining > 1e-6 || lot.entry_id === l.source_entry_id);
+}
+
 function risLineRowHtml(l, idx) {
   const item = l.item_id ? S.items.get(l.item_id) : null;
+  const lots = lotsForLine(item, l);
   return `<tr data-idx="${idx}">
-    <td><select class="ris_line_item" data-idx="${idx}">
+    <td><select class="ris_line_item" data-idx="${idx}" style="min-width:210px;">
       <option value="">-- pick item --</option>
       ${issuableItems(S.currentFund).map((a) => `<option value="${a.id}" ${a.id === l.item_id ? "selected" : ""}>${esc(a.stock_no)} - ${esc(a.description)} (${fmtNum(qtyBalance(a))} ${esc(a.unit)})</option>`).join("")}
     </select></td>
+    <td>${item ? `<select class="ris_line_src" data-idx="${idx}" style="min-width:210px;">
+        <option value="">-- pick AIR --</option>
+        ${lots.map((lot) => `<option value="${esc(lot.entry_id)}" ${lot.entry_id === l.source_entry_id ? "selected" : ""}>${esc(lotLabel(lot))} — ${fmtNum(lot.remaining)} left @ ${fmtMoney(lot.unit_cost)}</option>`).join("")}
+      </select>` : `<span class="small">pick an item first</span>`}</td>
     <td>${esc(item ? item.unit : l.unit || "")}</td>
     <td><input class="ris_line_qtyreq" data-idx="${idx}" type="number" step="0.01" value="${l.qty_requested || 0}"/></td>
     <td><input class="ris_line_qtyiss" data-idx="${idx}" type="number" step="0.01" value="${l.qty_issued != null ? l.qty_issued : ""}"/></td>
@@ -1513,9 +1568,19 @@ function openRisModal(id) {
         <div><label>Barangay / Address</label><input id="ris_barangay" value="${esc(r ? r.recipient_barangay || "" : "")}"/></div>
       </div>
       <div class="hr"></div>
-      <table class="line-table"><thead><tr><th>Item</th><th>Unit</th><th>Qty Requested</th><th>Qty Issued</th><th>Remarks</th><th></th></tr></thead>
+      <div class="panel small" style="margin-bottom:10px;">
+        <b>Start from an AIR.</b> Pick the delivery the stock is coming out of and load its items straight onto this RIS - quantities, units and costs come with them. You can load from more than one AIR, and you can still add lines by hand.
+        <div class="toolbar" style="margin-top:8px;">
+          <select id="ris_source_air" class="grow">
+            <option value="">-- pick an AIR --</option>
+            ${stockSources(S.currentFund).map((g) => `<option value="${esc(g.key)}">${esc(g.ref)}${g.date ? " · " + fmtDate(g.date) : ""} — ${g.lots.length} item(s) on hand</option>`).join("")}
+          </select>
+          <button class="btn" onclick="loadRisLinesFromAir()">Load items from this AIR</button>
+        </div>
+      </div>
+      <div class="table-wrap"><table class="line-table"><thead><tr><th>Item</th><th>Source AIR</th><th>Unit</th><th>Qty Requested</th><th>Qty Issued</th><th>Remarks</th><th></th></tr></thead>
         <tbody id="risLinesBody"></tbody>
-      </table>
+      </table></div>
       <button class="btn" style="margin-top:8px;" onclick="addRisLine()">+ Add line</button>
       <div class="hr"></div>
       <label>Purpose</label><textarea id="ris_purpose">${esc(r ? r.purpose || "" : "")}</textarea>
@@ -1549,6 +1614,21 @@ function openRisModal(id) {
       l.item_id = e.target.value;
       const item = S.items.get(l.item_id);
       if (item) { l.stock_no = item.stock_no; l.description = item.description; l.unit = item.unit; }
+      // A different item means the old lot no longer applies - clear it rather than carry a source
+      // that belongs to something else.
+      l.source_entry_id = ""; l.source_ref = ""; l.source_air_id = null;
+      l.source_batch_no = ""; l.source_expiry_date = ""; l.unit_cost = null;
+      renderRisLinesTable();                     // redraw so this line's AIR list is the right one
+      return;
+    } else if (e.target.classList.contains("ris_line_src")) {
+      const item = S.items.get(l.item_id);
+      const lot = lotsForLine(item, l).find((x) => x.entry_id === e.target.value);
+      l.source_entry_id = lot ? lot.entry_id : "";
+      l.source_ref = lot ? lot.ref : "";
+      l.source_air_id = lot ? lot.air_id : null;
+      l.source_batch_no = lot ? lot.batch_no : "";
+      l.source_expiry_date = lot ? lot.expiry_date : "";
+      l.unit_cost = lot ? lot.unit_cost : null;
     } else if (e.target.classList.contains("ris_line_qtyreq")) l.qty_requested = Number(e.target.value) || 0;
     else if (e.target.classList.contains("ris_line_qtyiss")) l.qty_issued = e.target.value === "" ? null : Number(e.target.value);
     else if (e.target.classList.contains("ris_line_remarks")) l.remarks = e.target.value;
@@ -1561,6 +1641,13 @@ function collectRisLines() {
     qty_requested: Number(l.qty_requested) || 0,
     qty_issued: l.qty_issued == null ? null : Number(l.qty_issued),
     remarks: l.remarks || "",
+    // Which delivery this line draws from, decided on the draft and confirmed at issuance.
+    source_entry_id: l.source_entry_id || "",
+    source_ref: l.source_ref || "",
+    source_air_id: l.source_air_id || null,
+    source_batch_no: l.source_batch_no || "",
+    source_expiry_date: l.source_expiry_date || "",
+    unit_cost: l.unit_cost == null ? null : Number(l.unit_cost),
   }));
 }
 
@@ -3243,6 +3330,7 @@ Object.assign(window, {
   setFund, setView, closeModal, __setTestUser, renderAll,
   openItemModal, saveItem, openItemDetail, discontinueItem, reactivateItem,
   openBulkOpeningModal, downloadOpeningTemplate, previewBulkOpening, importBulkOpening,
+  loadRisLinesFromAir,
   printSlc, printSc, exportRegistryCsv,
   exportMedicinesCsv,
   openAirModal, saveAir, addAirLine, removeAirLine, openAirDetail, deleteAir,
